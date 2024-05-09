@@ -1,0 +1,235 @@
+---
+title: "sobol_with_ode"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+
+library(tidyverse)
+library(deSolve)
+library(sensitivity)
+```
+
+```{r sen}
+source("R/dpopgrowth.R")
+
+dpopgrowth
+
+# come up with initial set of sample parameters
+# we will assume that we know the initial forest size of 10,
+# initial forest size
+time = seq(1, 300)
+Cinitial = 10
+thresh = 50
+K = 250
+r = 0.01
+g = 2
+
+parms = list(K = 250, r = 0.01, g = 2, thresh = 50)
+result = ode(y=Cinitial, 
+             times=time,
+             func=dpopgrowth, # growth function
+             parms=parms,
+             thresh = thresh)
+
+result <- as.data.frame(result)
+
+# rename 1 to carbon 
+ggplot(result, aes(time, `1`)) +
+  geom_point()
+
+
+
+
+```
+
+
+
+
+```{r}
+
+Cinitial = 10
+thresh = 50
+# want to learn about sensitivity to growth rate (r) and carrying capacity 
+# set the number of parameters
+np=2000
+
+K = rnorm(mean=250, sd=250*0.01, n=np)
+r = rnorm(mean=0.01, sd=0.01*0.01, n=np)
+g = rnorm(mean=2, sd=2*0.01, n=np)
+
+
+X1 = cbind.data.frame(K=K, r=r, g=g)
+
+# repeat to get our second set of samples
+K = rnorm(mean=250, sd=250*0.01, n=np)
+r = rnorm(mean=0.01, sd=0.01*0.01, n=np)
+g = rnorm(mean=2, sd=2*0.01, n=np)
+
+X2 = cbind.data.frame(K=K, r=r, g=g)
+
+# fix any negative values and they are not meaningful
+X1 = X1 %>% map_df(pmax, 0.0)
+X2 = X2 %>% map_df(pmax, 0.0)
+
+# create our sobel object and get sets of parameters for running the model
+# set 300 for number of bootstrap replicates
+
+sens_C = sobolSalt(model = NULL, X1, X2, nboot = 300)
+
+# our parameter sets are
+head(sens_C$X)
+
+# lets add names 
+colnames(sens_C$X) = c("r","K", "g")
+
+head(sens_C$X)
+
+# gets results for 300 years (evaluating every year)
+simtimes = seq(from=1, to=300)
+
+parms = list(r=sens_C$X[1,"r"], K=sens_C$X[1,"K"], g=sens_C$X[1,"g"])
+
+result = ode(y=Cinitial,
+             thresh = thresh,
+             times=simtimes,
+             func=dpopgrowth,
+             parms=parms)
+
+# head(result)
+# colnames(result)=c("time","C")
+# 
+# # turn it into a data frame
+# result = as.data.frame(result)
+# 
+# ggplot(result, aes(time, C))+
+#   geom_point()
+
+
+```
+# Compute our metric for all the parameter sets
+
+```{r}
+# gets results for 200 years (evaluating every year)
+thresh = 50
+simtimes = seq(from=1, to=300)
+parms = list(r=sens_P$X[1,"r"], 
+             K=sens_P$X[1,"K"], 
+             g=sens_P$X[1,"g"])
+
+# run the ODE solver with these conditions
+result = ode(y=Cinitial, 
+             times=simtimes,
+             func=dforestgrowth, # growth function
+             parms=parms,
+             thresh = thresh)
+
+result = as.data.frame(result)
+
+# rename the column names
+colnames(result)=c("time","C")
+```
+
+
+What if we want to run for all parameters
+
+Lets create two additional functions that will help us
+
+* a function that computes the metrics we want
+
+* a function that runs our ode solver and computes the metrics (I call it a wrapper function as it is really just a workflow/wrapper to call ode solver and then compute metrics)
+```{r sen2}
+# turn computing our metrics into a function
+
+compute_metrics = function(result, thresh) {
+  maxpop = max(result$P)
+idx = which(result$P > thresh)[1]
+idx = ifelse(is.na(idx), length(result$P), idx)
+threshyear = result$time[idx]
+return(list(maxpop=maxpop, threshyear=threshyear))}
+
+# try it on our first parameter set, and look at when it gets to 100
+compute_metrics(result, 100)
+
+# great but we need to apply the ode and this function for all of our parameters
+
+
+
+# define a wrapper function to do everything we need - run solver and compute metrics - and send back results for each parameter
+
+# lets make the threshold 90% of carrying capacity
+
+p_wrapper = function(r,K, Pinitial, simtimes, odefunc, metricfunc) {
+    parms = list(r=r, K=K)
+    result = ode(y=Pinitial, times=simtimes, func=odefunc, parms=parms) 
+    colnames(result)=c("time","P")
+  # get metrics
+  metrics=metricfunc(as.data.frame(result), thresh=100)
+  return(metrics)
+}
+
+# test
+p_wrapper(r=0.01, K=150, Pinitial=3, simtimes=seq(from=1,to=10),
+         odefunc=dpopgrowth, metricfunc=compute_metrics)
+```
+
+
+
+# Next step
+
+Run the wrapper for all parameters and look at results
+
+
+```{r userwarpper}
+# now use pmap as we did before
+
+allresults = as.data.frame(sens_P$X) %>% pmap(p_wrapper, Pinitial=Pinitial, simtimes=simtimes, odefunc=dpopgrowth, metricfunc=compute_metrics)
+
+# extract out results from pmap into a data frame
+allres = allresults %>% map_dfr(`[`,c("maxpop","threshyear"))
+
+# maxpop and threshyear
+allres
+
+# can put everything together
+tmp_all = cbind.data.frame(allres, sens_P$X)
+head(tmp_all)
+
+# why does this vary, because we have varied K aka carrying capacity
+ggplot(tmp_all, aes(r, threshyear, col=K))+geom_point()
+
+
+# create boxplots
+tmp = allres %>% pivot_longer(cols=everything(),names_to="metric", values_to="value")
+ggplot(tmp, aes(metric, value, col=metric))+geom_boxplot()
+
+```
+
+# Compute the sobol indicies for each metric
+
+```{r sen3}
+# sobol can only handle one output at a time  - so we will need to do them separately
+sens_P_maxpop = sensitivity::tell(sens_P,allres$maxpop)
+
+# first-order indices (main effect without co-variance)
+rownames(sens_P_maxpop$S)=c("r","K")
+sens_P_maxpop$S
+
+# total sensitivity index -note that this partitions the output variance 
+rownames(sens_P_maxpop$T)=c("r","K")
+sens_P_maxpop$T
+
+
+# create another one for max year; tell 
+sens_P_threshyear = sensitivity::tell(sens_P,allres$threshyear)
+# first-order indices (main effect without co-variance) - k uncertainty is more important for max
+rownames(sens_P_threshyear$S)=c("r","K")
+sens_P_threshyear$S
+
+# total sensitivity index -note that this partitions the output variance - so values sum to 1
+rownames(sens_P_threshyear$T)=c("r","K")
+sens_P_threshyear$T
+
+```
+
